@@ -1,4 +1,4 @@
-data/*.csv
-data/*.xlsx
+data/
 *.pkl
 __pycache__/
+.env

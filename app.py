@@ -56,7 +56,7 @@ st.markdown("""
     .main-title {
         font-size: 5rem;
         font-weight: 800;
-        color: #2c7be5;                # ← a clear blue — readable on both themes;
+        color: #2c7be5;                
         margin-bottom: 0;
         letter-spacing: -0.5px;
     }
@@ -160,27 +160,35 @@ st.markdown("""
 @st.cache_data
 def load_processed_data():
     """
-    Loads all four processed CSVs produced by rainfall_pipeline.py.
-    Returns a dict of DataFrames keyed by name.
+    Loads all four processed CSVs directly from Google Drive.
+    To update: replace the file ID strings below with your own.
+    Get the file ID from the sharing link:
+      https://drive.google.com/drive/folders/19YpQ1g7SOaZup3iLS75Gme315cnpfg7Q?usp=drive_link
     """
-    base = "data/processed/"
 
-    files = {
-        "monthly"     : "02_monthly_with_departure.csv",
-        "seasonal"    : "03_seasonal_with_departure.csv",
-        "probability" : "04_above_normal_probability.csv",
+    # ── Paste your Google Drive file IDs here ──────────────────────────
+    FILE_IDS = {
+        "monthly"     : "1AY2n7HBfu0BsrLlDL80iflWqlqLSYiMH",
+        "seasonal"    : "1rnbhP44S_gah-v7L6BRJKBZInwLSLjDG",
+        "probability" : "1wHgLiXOuvqLmpzaPSoj73rWpTPmHYgp2",
     }
+    # ───────────────────────────────────────────────────────────────────
+
+    def drive_url(file_id: str) -> str:
+        # Converts a Drive file ID into a direct download URL pandas can read
+        return f"https://drive.google.com/uc?export=download&id={file_id}"
 
     data = {}
-    for key, filename in files.items():
-        path = os.path.join(base, filename)
-        if not os.path.exists(path):
+    for key, file_id in FILE_IDS.items():
+        try:
+            data[key] = pd.read_csv(drive_url(file_id))
+        except Exception as e:
             st.error(
-                f"Missing file: `{path}`\n\n"
-                "Please run `rainfall_pipeline.py` first to generate processed data."
+                f"Could not load '{key}' from Google Drive.\n\n"
+                f"Check that the file ID is correct and the file is shared "
+                f"publicly (Anyone with the link → Viewer).\n\nError: {e}"
             )
             st.stop()
-        data[key] = pd.read_csv(path)
 
     return data
 
