@@ -27,10 +27,12 @@ import numpy as np
 import os
 import pickle                          # Used to save/load the trained model
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import LeaveOneOut, cross_val_score
+from sklearn.model_selection import LeaveOneOut, cross_val_score, cross_val_predict
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import classification_report, confusion_matrix
 import warnings
+import matplotlib.pyplot as plt
+import seaborn as sns
 warnings.filterwarnings("ignore")      # Suppress minor sklearn warnings
 
 
@@ -331,6 +333,42 @@ def split_and_evaluate(features_df: pd.DataFrame) -> tuple:
         verdict = "WEAK — model struggles; more data or features needed"
     print(f"  Verdict            : {verdict}\n")
 
+    # ── Confusion Matrix via LOOCV predictions ─────────────────────────────
+    # cross_val_predict collects each fold's held-out prediction,
+    # giving us a full y_pred aligned with y for the confusion matrix.
+    print("Generating confusion matrix from LOOCV predictions...")
+    y_pred_loo = cross_val_predict(model, X, y, cv=loo)
+
+    cm = confusion_matrix(y, y_pred_loo)
+    print("\nConfusion Matrix (LOOCV):")
+    print(f"  Labels: 0 = Not Above-Normal | 1 = Above-Normal")
+    print(cm)
+    print()
+    print(classification_report(
+        y, y_pred_loo,
+        target_names=["Not Above-Normal", "Above-Normal"]
+    ))
+
+    # ── Plot and save confusion matrix ────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sns.heatmap(
+        cm,
+        annot=True, fmt="d", cmap="Blues",
+        xticklabels=["Not Above-Normal", "Above-Normal"],
+        yticklabels=["Not Above-Normal", "Above-Normal"],
+        ax=ax
+    )
+    ax.set_xlabel("Predicted Label", fontsize=12)
+    ax.set_ylabel("True Label", fontsize=12)
+    ax.set_title("Confusion Matrix — Rainfall Prediction (LOOCV)", fontsize=13)
+    plt.tight_layout()
+
+    os.makedirs("models", exist_ok=True)
+    cm_path = "models/confusion_matrix.png"
+    plt.savefig(cm_path, dpi=150)
+    plt.close()
+    print(f"Confusion matrix plot saved → {cm_path}\n")
+
     # ── Train FINAL model on ALL data ──────────────────────────────────────
     # LOOCV was only for evaluation. The actual deployed model trains on
     # everything — more data = better generalisation for new predictions.
@@ -350,7 +388,7 @@ def split_and_evaluate(features_df: pd.DataFrame) -> tuple:
         print(f"  {row['feature']:<30} {bar}  {row['importance']:.3f}")
     print()
 
-    return model, cv_scores, importance_df
+    return model, cv_scores, importance_df, y_pred_loo
 
 
 # =============================================================================
@@ -574,7 +612,7 @@ def run_trainer():
     features_df, le_district, le_state = build_feature_matrix(seasonal_df)
 
     # Step 3: Evaluate with LOOCV, train final model on full data
-    model, cv_scores, importance_df = split_and_evaluate(features_df)
+    model, cv_scores, importance_df, y_pred_loo = split_and_evaluate(features_df)
 
     # Step 4: Save model, encoders, and report to disk
     print("Saving model artifacts...")

@@ -692,7 +692,7 @@ def main():
             st.pyplot(fig_heat, use_container_width=True)
         else:
             st.info("No monthly data available for this district.")
-
+    
     # ── ROW 4: Raw Data Table (collapsible) ───────────────────────────────
     with st.expander("📊 View raw seasonal data for this district"):
 

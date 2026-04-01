@@ -104,7 +104,7 @@ def clean_and_standardise(df: pd.DataFrame) -> pd.DataFrame:
     COL_DISTRICT: "district_name",
     COL_RAINFALL: "rainfall_mm",
     })
-
+    
 # Safety check — confirm the rename worked
     print(f"Columns after rename: {df.columns.tolist()}")
     assert "rainfall_mm" in df.columns, \
@@ -130,6 +130,18 @@ def clean_and_standardise(df: pd.DataFrame) -> pd.DataFrame:
     # treated as a different district from "Warangal". .str.strip() fixes this.
     df["state_name"]    = df["state_name"].str.strip().str.title()
     df["district_name"] = df["district_name"].str.strip().str.title()
+
+    DISTRICT_NAME_CORRECTIONS = {
+        "Jagtial"              : "Jagitial",
+        "Jangoan"              : "Jangaon",
+        "Kumuram Bheem"        : "Kumuram Bheem Asifabad",
+        "Medchal-Malkajgiri"   : "Medchal Malkajgiri",
+        "Rangareddy"           : "Ranga Reddy",
+        "Ranjanna Sircilla"    : "Rajanna Sircilla",
+        "Warangal Rural"       : "Warangal (Rural)",
+        "Warangal Urban"       : "Warangal (Urban)",
+    }
+    df["district_name"] = df["district_name"].replace(DISTRICT_NAME_CORRECTIONS)
 
     # ── D. Handle missing rainfall values ──────────────────────────────────
     missing_count = df["rainfall_mm"].isna().sum()
