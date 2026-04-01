@@ -17,67 +17,58 @@ import glob
 
 
 # =============================================================================
-# SECTION 1 — CONFIGURATION
-# Change these paths/column names to match your actual CSV structure.
+# SECTION 1 — UPDATED CONFIGURATION
 # =============================================================================
 
-# Folder that contains all your yearly CSV files (e.g. 2016.csv, 2017.csv …)
-DATA_FOLDER = "data/raw/"
+# Instead of a local folder, use a dictionary of your raw yearly file IDs
+RAW_FILE_IDS = {
+    "2018": "1GJtKaG1Ht82cDrYUSyLi63lUdx_fONrT",
+    "2019": "1OS_JAicP0iE-ZiMWye8m_ynfJ5Ypf2eO",
+    "2020": "1nB6qe_6SqVPDx5yyCVGJcX-ydeqtwlrE",
+    "2021": "1QwtMNFi-TxS3sn2SM9BteuDGSQS3L5mW",
+    "2022": "1179FbAiLT1KZJAvQiBcE8T2NQPHAC7zE",
+    "2023": "1OgHoFuSwd_JUdadvuxPV1Pj0QFBE4sjf",
+    "2024": "1q_yHt0UeqOzo1Kvzz8MTjaP-KEKBU3hr",
+    # Add all years through 2024
+}
 
-# The exact column names as they appear in your IMD CSV headers.
-# If your CSVs use different names, update ONLY these constants — nothing else.
-COL_DATE       = "Date"           # e.g. "2016-06-01" or "01-06-2016"
-COL_STATE      = "State"
-COL_DISTRICT   = "District"
-COL_RAINFALL   = "Avg_rainfall"
-
-# Kharif season = June (6) through September (9)
-# Rabi  season  = October (10) through February (2)
-KHARIF_MONTHS  = [6, 7, 8, 9]
-RABI_MONTHS    = [10, 11, 12, 1, 2]
-
+def drive_url(file_id: str) -> str:
+    return f"https://drive.google.com/uc?export=download&id={file_id}"
 
 # =============================================================================
-# SECTION 2 — LOAD & MERGE ALL YEARLY CSVs
+# SECTION 2 — UPDATED LOAD FUNCTION
 # =============================================================================
 
-def load_all_csvs(folder_path: str) -> pd.DataFrame:
+def load_all_csvs(file_ids_dict: dict) -> pd.DataFrame:
     """
-    Scans a folder for all .csv files, loads each one into a DataFrame,
-    then stacks them all into a single combined DataFrame.
-
-    Why glob instead of listing files manually?
-    → It automatically finds every .csv without you needing to type filenames.
+    Loads yearly CSVs directly from Google Drive links.
     """
+    yearly_frames = []
 
-    # Build a list of every file path ending in .csv inside the folder
-    csv_files = glob.glob(os.path.join(folder_path, "*.csv"))
+    print(f"Starting Drive download for years: {list(file_ids_dict.keys())}")
 
-    if not csv_files:
-        raise FileNotFoundError(
-            f"No CSV files found in '{folder_path}'. "
-            "Check your DATA_FOLDER path in the config section above."
-        )
+    for year, f_id in file_ids_dict.items():
+        url = drive_url(f_id)
+        try:
+            # Pandas can read directly from a URL
+            df_year = pd.read_csv(url)
+            
+            # We still add the 'source_file' column so the rest of your 
+            # pipeline (cleaning/standardization) works exactly the same.
+            df_year["source_file"] = f"{year}.csv"
+            
+            yearly_frames.append(df_year)
+            print(f"  ✅ Successfully loaded {year}")
+            
+        except Exception as e:
+            print(f"  ❌ Error loading {year}: {e}")
+            print("  Check if the file is shared as 'Anyone with the link' in Drive.")
 
-    print(f"Found {len(csv_files)} CSV files: {[os.path.basename(f) for f in csv_files]}")
+    if not yearly_frames:
+        raise ValueError("No data was loaded. Pipeline cannot continue.")
 
-    yearly_frames = []   # We'll collect each year's DataFrame here
-
-    for file_path in csv_files:
-        # Load one year's CSV into a DataFrame
-        df_year = pd.read_csv(file_path)
-
-        # Record which file this row came from — useful for debugging later
-        df_year["source_file"] = os.path.basename(file_path)
-
-        yearly_frames.append(df_year)
-        print(f"  Loaded: {os.path.basename(file_path)}  →  {len(df_year):,} rows")
-
-    # pd.concat stacks all DataFrames vertically (row-by-row) into one big table.
-    # ignore_index=True resets the row numbers so they run 0,1,2,… continuously.
+    # Stack them all together
     combined_df = pd.concat(yearly_frames, ignore_index=True)
-
-    print(f"\nTotal rows after merging all files: {len(combined_df):,}\n")
     return combined_df
 
 
