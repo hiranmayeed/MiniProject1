@@ -15,6 +15,10 @@ import numpy as np
 import os
 import glob
 
+# Season month groups used by assign_season()
+KHARIF_MONTHS = {6, 7, 8, 9}
+RABI_MONTHS = {10, 11, 12, 1, 2}
+
 
 # =============================================================================
 # SECTION 1 — UPDATED CONFIGURATION
@@ -90,16 +94,16 @@ def clean_and_standardise(df: pd.DataFrame) -> pd.DataFrame:
     # If a column name already matches, this is a no-op (harmless).
     # NEW
     df = df.rename(columns={
-    COL_DATE:     "date",
-    COL_STATE:    "state_name",
-    COL_DISTRICT: "district_name",
-    COL_RAINFALL: "rainfall_mm",
+    "Date":     "date",
+    "State":    "state_name",
+    "District": "district_name",
+    "Avg_rainfall": "rainfall_mm",
     })
     
 # Safety check — confirm the rename worked
     print(f"Columns after rename: {df.columns.tolist()}")
     assert "rainfall_mm" in df.columns, \
-    f"Rename failed. COL_RAINFALL='{COL_RAINFALL}' not found in CSV. " \
+    f"Rename failed. COL_RAINFALL='{"Avg_rainfall"}' not found in CSV. " \
     f"Available columns: {df.columns.tolist()}"
     # ── B. Parse dates ─────────────────────────────────────────────────────
     # pd.to_datetime handles most date formats automatically (YYYY-MM-DD,
@@ -466,7 +470,7 @@ def run_pipeline():
     print("=" * 65 + "\n")
 
     # Step 1: Load and merge all yearly CSVs
-    raw_df = load_all_csvs(DATA_FOLDER)
+    raw_df = load_all_csvs(RAW_FILE_IDS)
 
     # Step 2: Clean, standardise, and fill missing values
     clean_df = clean_and_standardise(raw_df)
