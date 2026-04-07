@@ -1,216 +1,341 @@
 """
 =============================================================================
 RAINFALL ANALYSIS & PREDICTION FRAMEWORK
-Step 3: Prediction Engine — ML Trainer
+Step 3: Prediction Engine — v4 (Climate Context Features)
 =============================================================================
-Purpose : Train a Random Forest classifier that predicts whether the
-          remaining monsoon season will be 'Above-Normal' based on
-          June's rainfall data for a given district.
-Input   : data/processed/03_seasonal_with_departure.csv  (from Step 2)
-Output  : models/rainfall_model.pkl   — the saved trained model
-          models/model_metadata.pkl   — label encoders + feature info
-Author  : (your name)
-=============================================================================
+New features over v3:
+  - june_spi_30d          : SPI Z-score for June (normalised drought level)
+  - enso_code             : ENSO state (0=La Niña, 1=Neutral, 2=El Niño)
+  - susm_may_mean         : pre-monsoon sub-surface soil moisture (mm)
+  - susm_may_max          : peak pre-monsoon soil moisture (mm)
+  - temp_june_mean        : mean June temperature (°C)
+  - temp_june_stress_days : heat stress days in June (>35°C)
 
-BEGINNER CONCEPT — What is a Random Forest?
-────────────────────────────────────────────
-Think of it as 100 people (decision trees) each independently looking at
-your rainfall data and voting "Above-Normal" or "Not Above-Normal".
-The majority vote becomes the final prediction.
-It's robust, works well with small datasets (like our 8 years), and
-doesn't need the data to follow any particular statistical distribution.
+GridSearchCV re-runs with the expanded feature set. New optimal
+hyperparameters may differ from v3 now that the model has climate context.
+
+Run with: python train_model.py
 =============================================================================
 """
 
 import pandas as pd
 import numpy as np
 import os
-import pickle                          # Used to save/load the trained model
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import LeaveOneOut, cross_val_score, cross_val_predict
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import classification_report, confusion_matrix
-import warnings
+import pickle
 import matplotlib.pyplot as plt
-import seaborn as sns
-warnings.filterwarnings("ignore")      # Suppress minor sklearn warnings
+import matplotlib.patches as mpatches
+import warnings
+warnings.filterwarnings("ignore")
+
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import GridSearchCV, LeaveOneOut, cross_val_score
+from sklearn.preprocessing import LabelEncoder
 
 
 # =============================================================================
 # SECTION 1 — CONFIGURATION
 # =============================================================================
 
-# Path to the seasonal output file produced by rainfall_pipeline.py (Step 2)
-SEASONAL_DATA_PATH = "data/processed/03_seasonal_with_departure.csv"
-
-# Folder where we'll save the trained model
+SEASONAL_DATA_PATH  = "data/processed/03_seasonal_with_departure.csv"
+MONTHLY_DATA_PATH   = "data/processed/02_monthly_with_departure.csv"
+DAILY_DATA_PATH     = "data/processed/01_daily_clean.csv"
 MODEL_OUTPUT_FOLDER = "models/"
 
-# The month number we use as our early-season predictor signal
-# June = 6 (first month of Kharif; available before the full season ends)
-PREDICTOR_MONTH = 6
-
-# The season we're predicting for
-TARGET_SEASON = "Kharif"
-
-# The departure % threshold that defines "Above-Normal" (from IMD standard)
+PREDICTOR_MONTH        = 6
+TARGET_SEASON          = "Kharif"
 ABOVE_NORMAL_THRESHOLD = 5.0
 
 
 # =============================================================================
-# SECTION 2 — LOAD AND VALIDATE THE CLEANED DATA
+# SECTION 2 — LOAD DATA
 # =============================================================================
 
-def load_seasonal_data(path: str) -> pd.DataFrame:
+def load_data() -> tuple:
+    """Loads seasonal, monthly, and daily CSVs from data/processed/."""
+
+    for path in [SEASONAL_DATA_PATH, MONTHLY_DATA_PATH, DAILY_DATA_PATH]:
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Missing: '{path}'\n"
+                "Run rainfall_pipeline.py first."
+            )
+
+    seasonal_df = pd.read_csv(SEASONAL_DATA_PATH)
+    monthly_df  = pd.read_csv(MONTHLY_DATA_PATH)
+    daily_df    = pd.read_csv(DAILY_DATA_PATH, parse_dates=["date"])
+
+    print(f"Seasonal : {len(seasonal_df):,} rows | "
+          f"{seasonal_df['district_name'].nunique()} districts | "
+          f"years: {sorted(seasonal_df['year'].unique().tolist())}")
+    print(f"Monthly  : {len(monthly_df):,} rows")
+    print(f"Daily    : {len(daily_df):,} rows\n")
+
+    return seasonal_df, monthly_df, daily_df
+
+
+# =============================================================================
+# SECTION 3 — MASTER FEATURE LIST
+# =============================================================================
+
+def get_feature_columns() -> list:
     """
-    Loads the seasonal CSV produced by the pipeline in Step 2.
-    Validates that required columns are present before proceeding.
+    Complete list of features fed to the model — v4 edition.
+    ORDER MATTERS. make_ml_prediction() in app.py must match this exactly.
+
+    Feature groups:
+      Group A — Core June rainfall signal (4 features)
+      Group B — Temporal / pattern features (5 features)
+      Group C — Climate context: SPI + ENSO (2 features)
+      Group D — GEE features: soil moisture + temperature (4 features)
+      Group E — District historical context (3 features)
+      Group F — Identity encoding (2 features)
+
+    Total: 20 features
+    GEE features (susm_may_mean, susm_may_max, temp_june_mean,
+    temp_june_stress_days) will be NaN if GEE hasn't been run yet.
+    The model handles NaN gracefully via imputation in build_feature_matrix().
     """
+    return [
+        # ── Group A: Core June signal ─────────────────────────────────────
+        "june_rainfall_mm",
+        "june_departure_pct",
+        "june_vs_district_mean",
+        "june_was_above_normal",
 
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Could not find '{path}'.\n"
-            "Make sure you've run rainfall_pipeline.py first (Step 2)."
-        )
+        # ── Group B: Temporal pattern features ───────────────────────────
+        "june_rolling_7d_avg",
+        "june_cumulative_rain",
+        "june_rain_lag_1d",
+        "june_rain_lag_7d",
+        "june_dry_streak",
 
-    df = pd.read_csv(path)
+        # ── Group C: Climate context ──────────────────────────────────────
+        "june_spi_30d",             # SPI Z-score — normalised drought level
+        "enso_code",                # 0=La Niña, 1=Neutral, 2=El Niño
 
-    # Columns we absolutely need for training
-    required_columns = [
-        "district_name", "state_name", "year",
-        "season", "total_rainfall_mm", "departure_pct"
+        # ── Group D: GEE features (NaN if GEE not run) ───────────────────
+        "susm_may_mean",            # Pre-monsoon sub-surface soil moisture
+        "susm_may_max",             # Peak pre-monsoon soil moisture
+        "temp_june_mean",           # Mean June temperature (°C)
+        "temp_june_stress_days",    # Days > 35°C in June
+
+        # ── Group E: District historical context ──────────────────────────
+        "district_mean_mm",
+        "district_std_mm",
+        "district_cv",
+
+        # ── Group F: Identity encoding ────────────────────────────────────
+        "district_encoded",
+        "state_encoded",
     ]
 
-    missing = [col for col in required_columns if col not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns in seasonal data: {missing}")
-
-    print(f"Loaded seasonal data: {len(df):,} rows")
-    print(f"Districts: {df['district_name'].nunique()} | "
-          f"Years: {sorted(df['year'].unique())}\n")
-
-    return df
-
 
 # =============================================================================
-# SECTION 3 — FEATURE ENGINEERING
+# SECTION 4 — TEMPORAL FEATURES FROM DAILY DATA
 # =============================================================================
 
-"""
-BEGINNER CONCEPT — What is Feature Engineering?
-────────────────────────────────────────────────
-A "feature" is any input variable the model uses to make its prediction.
-Raw data (like total_rainfall_mm) is rarely in the right shape for ML.
-Feature engineering = transforming raw data into signals the model can learn from.
-
-Our prediction question:
-  "Given only June's rainfall for a district, can we predict whether
-   the full Kharif season (June–September) will be Above-Normal?"
-
-Why only June?
-  In a real deployment, when June ends, the farmer needs an EARLY warning
-  for July–September. We can only use data that exists at prediction time.
-"""
-
-def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
+def compute_june_temporal_features(daily_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Transforms raw seasonal data into a feature matrix ready for ML.
-
-    Each row in the output represents ONE district in ONE year, with:
-      - Features (X): what we KNOW at prediction time (June's rainfall)
-      - Target  (y): what we want to PREDICT (was the full season Above-Normal?)
+    Computes rolling, cumulative, lag, and dry-streak features
+    for June only. Returns one row per (district_name, year).
     """
 
-    # ── Step 3a: Filter to Kharif season only ─────────────────────────────
-    # We only predict for Kharif (monsoon) season — that's what matters for
-    # farmers' primary sowing decisions.
-    kharif_df = df[df["season"] == TARGET_SEASON].copy()
-    print(f"Kharif rows: {len(kharif_df):,}")
+    print("── Computing June temporal features ───────────────────────────")
 
-    # ── Step 3b: Create the TARGET variable (what we predict) ─────────────
-    # Binary classification: 1 = Above-Normal season, 0 = Not Above-Normal
-    # This becomes the "answer key" the model learns from.
-    kharif_df["target_above_normal"] = (
-        kharif_df["departure_pct"] > ABOVE_NORMAL_THRESHOLD
-    ).astype(int)
+    df = daily_df.copy()
+    df["date"]  = pd.to_datetime(df["date"])
+    df["year"]  = df["date"].dt.year
+    df["month"] = df["date"].dt.month
+    df = df.sort_values(["district_name", "date"]).reset_index(drop=True)
 
-    above_count = kharif_df["target_above_normal"].sum()
-    print(f"Above-Normal seasons in data: {above_count} / {len(kharif_df)} "
-          f"({above_count/len(kharif_df)*100:.1f}%)\n")
+    # 7-day rolling average
+    df["rolling_7d"] = (
+        df.groupby("district_name")["rainfall_mm"]
+        .transform(lambda s: s.rolling(window=7, min_periods=1).mean())
+    )
 
-    # ── Step 3c: Build June-only predictor features ────────────────────────
-    # We need a separate monthly DataFrame to extract June figures.
-    # IMPORTANT: This assumes you also have 02_monthly_with_departure.csv
-    monthly_path = "data/processed/02_monthly_with_departure.csv"
+    # Cumulative within each month
+    df["cumulative_rain"] = (
+        df.groupby(["district_name", "year", "month"])["rainfall_mm"]
+        .transform("cumsum")
+    )
 
-    if not os.path.exists(monthly_path):
-        raise FileNotFoundError(
-            f"Could not find '{monthly_path}'.\n"
-            "Ensure rainfall_pipeline.py has been run successfully."
-        )
+    # Lag features
+    df["rain_lag_1d"] = (
+        df.groupby("district_name")["rainfall_mm"]
+        .transform(lambda s: s.shift(1))
+    ).fillna(0)
 
-    monthly_df = pd.read_csv(monthly_path)
+    df["rain_lag_7d"] = (
+        df.groupby("district_name")["rainfall_mm"]
+        .transform(lambda s: s.shift(7))
+    ).fillna(0)
 
-    # Filter to June rows only (month == 6)
-    june_df = monthly_df[monthly_df["month"] == PREDICTOR_MONTH][
-        ["district_name", "year", "total_rainfall_mm", "departure_pct"]
-    ].copy()
+    # Dry streak (max consecutive days < 2.5mm)
+    def max_dry_streak(series: pd.Series) -> int:
+        max_s = curr_s = 0
+        for v in series:
+            if v < 2.5:
+                curr_s += 1
+                max_s   = max(max_s, curr_s)
+            else:
+                curr_s  = 0
+        return max_s
 
-    # Rename columns so we know they're June-specific features
-    june_df = june_df.rename(columns={
-        "total_rainfall_mm": "june_rainfall_mm",
-        "departure_pct":     "june_departure_pct"
-    })
+    june_df = df[df["month"] == PREDICTOR_MONTH].copy()
 
-    # ── Step 3d: Compute historical district-level features ────────────────
-    # These give the model context about each district's typical behaviour.
-    # "Is 150mm high for this district, or is that normal for them?"
-
-    district_stats = (
-        kharif_df.groupby("district_name")["total_rainfall_mm"]
+    june_features = (
+        june_df.groupby(["district_name", "year"])
         .agg(
-            district_mean_mm   = "mean",   # avg seasonal rainfall over 8 years
-            district_std_mm    = "std",    # how variable rainfall is
-            district_cv        = lambda x: x.std() / x.mean()  # coefficient of variation
+            june_rolling_7d_avg  = ("rolling_7d",      "mean"),
+            june_cumulative_rain = ("cumulative_rain",  "max"),
+            june_rain_lag_1d     = ("rain_lag_1d",      "mean"),
+            june_rain_lag_7d     = ("rain_lag_7d",      "mean"),
+            june_dry_streak      = ("rainfall_mm",
+                                    lambda x: max_dry_streak(x)),
         )
         .reset_index()
     )
 
-    # ── Step 3e: Merge everything into one feature matrix ──────────────────
-    # Start with Kharif seasonal rows (one per district-year)
+    print(f"  Temporal features: "
+          f"{june_features['district_name'].nunique()} districts × "
+          f"{june_features['year'].nunique()} years\n")
+
+    return june_features
+
+
+# =============================================================================
+# SECTION 5 — SPI FEATURES FROM DAILY DATA
+# =============================================================================
+
+def compute_june_spi(daily_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Extracts the mean 30-day SPI for June per (district, year).
+    Requires 'spi_30d' column already computed by the pipeline.
+    If not present, returns empty DataFrame with correct columns.
+    """
+
+    if "spi_30d" not in daily_df.columns:
+        print("  ⚠️  spi_30d not in daily data. "
+              "Run rainfall_pipeline.py v4 to compute SPI.")
+        return pd.DataFrame(columns=["district_name", "year", "june_spi_30d"])
+
+    june_df = daily_df[daily_df["month"] == PREDICTOR_MONTH].copy() \
+              if "month" in daily_df.columns else \
+              daily_df[pd.to_datetime(daily_df["date"]).dt.month == PREDICTOR_MONTH].copy()
+
+    spi_agg = (
+        june_df.groupby(["district_name", "year"])["spi_30d"]
+        .mean()
+        .round(3)
+        .reset_index()
+        .rename(columns={"spi_30d": "june_spi_30d"})
+    )
+
+    return spi_agg
+
+
+# =============================================================================
+# SECTION 6 — BUILD FEATURE MATRIX
+# =============================================================================
+
+def build_feature_matrix(seasonal_df: pd.DataFrame,
+                          monthly_df:  pd.DataFrame,
+                          daily_df:    pd.DataFrame) -> tuple:
+    """
+    Merges all feature sources into one ML-ready matrix.
+    NaN GEE features are median-imputed per district so the model
+    can train even before GEE data is available.
+    """
+
+    # ── Target variable ────────────────────────────────────────────────────
+    kharif_df = seasonal_df[seasonal_df["season"] == TARGET_SEASON].copy()
+    print(f"Kharif rows: {len(kharif_df)}")
+
+    kharif_df["target_above_normal"] = (
+        kharif_df["departure_pct"] > ABOVE_NORMAL_THRESHOLD
+    ).astype(int)
+
+    above = kharif_df["target_above_normal"].sum()
+    print(f"Above-Normal: {above}/{len(kharif_df)} "
+          f"({above/len(kharif_df)*100:.1f}%)\n")
+
+    # ── Core June features from monthly ───────────────────────────────────
+    june_monthly = monthly_df[monthly_df["month"] == PREDICTOR_MONTH][
+        ["district_name", "year", "total_rainfall_mm", "departure_pct"]
+    ].copy().rename(columns={
+        "total_rainfall_mm": "june_rainfall_mm",
+        "departure_pct"    : "june_departure_pct",
+    })
+
+    # ── Temporal features from daily ───────────────────────────────────────
+    june_temporal = compute_june_temporal_features(daily_df)
+
+    # ── SPI from daily ─────────────────────────────────────────────────────
+    june_spi = compute_june_spi(daily_df)
+
+    # ── ENSO from seasonal ────────────────────────────────────────────────
+    enso_cols = ["district_name", "year", "enso_code"]
+    if "enso_code" in kharif_df.columns:
+        enso_df = kharif_df[enso_cols].copy()
+    else:
+        enso_df = pd.DataFrame(columns=enso_cols)
+        print("  ⚠️  enso_code not in seasonal data. "
+              "Run rainfall_pipeline.py v4.")
+
+    # ── GEE features from seasonal ────────────────────────────────────────
+    gee_cols = ["district_name", "year",
+                "susm_may_mean", "susm_may_max",
+                "temp_june_mean", "temp_june_stress_days"]
+    gee_present = [c for c in gee_cols if c in kharif_df.columns]
+    gee_df = kharif_df[gee_present].copy() if len(gee_present) > 2 else \
+             pd.DataFrame(columns=gee_cols)
+
+    # ── District historical stats ──────────────────────────────────────────
+    district_stats = (
+        kharif_df.groupby("district_name")["total_rainfall_mm"]
+        .agg(
+            district_mean_mm = "mean",
+            district_std_mm  = "std",
+            district_cv      = lambda x: x.std() / x.mean() if x.mean() > 0 else 0
+        )
+        .reset_index()
+    )
+
+    # ── Merge all sources ──────────────────────────────────────────────────
     features_df = kharif_df[
         ["district_name", "state_name", "year", "target_above_normal"]
     ].copy()
 
-    # Merge in June rainfall features (left join keeps all kharif rows)
-    features_df = features_df.merge(
-        june_df, on=["district_name", "year"], how="left"
-    )
+    features_df = features_df.merge(june_monthly,   on=["district_name","year"], how="left")
+    features_df = features_df.merge(june_temporal,  on=["district_name","year"], how="left")
+    features_df = features_df.merge(june_spi,       on=["district_name","year"], how="left")
+    features_df = features_df.merge(district_stats, on="district_name",          how="left")
 
-    # Merge in district historical context
-    features_df = features_df.merge(
-        district_stats, on="district_name", how="left"
-    )
+    if not enso_df.empty:
+        features_df = features_df.merge(enso_df, on=["district_name","year"], how="left")
+    else:
+        features_df["enso_code"] = 1   # default to Neutral
 
-    # ── Step 3f: Add derived features ──────────────────────────────────────
-    # "How does this June compare to this district's historical average?"
-    # This normalises June rainfall relative to each district's baseline.
+    if not gee_df.empty and len(gee_present) > 2:
+        features_df = features_df.merge(gee_df, on=["district_name","year"], how="left")
+    else:
+        for col in ["susm_may_mean","susm_may_max",
+                    "temp_june_mean","temp_june_stress_days"]:
+            features_df[col] = np.nan
+
+    # ── Derived features ───────────────────────────────────────────────────
     features_df["june_vs_district_mean"] = (
         features_df["june_rainfall_mm"] / features_df["district_mean_mm"]
     ).round(4)
 
-    # Flag: was this June itself already above-normal?
     features_df["june_was_above_normal"] = (
         features_df["june_departure_pct"] > ABOVE_NORMAL_THRESHOLD
     ).astype(int)
 
-    # ── Step 3g: Encode district and state as numbers ─────────────────────
-    # Random Forest needs numbers, not text. LabelEncoder converts
-    # "Warangal" → 42, "Hyderabad" → 17, etc.
-    # We save the encoder so the dashboard can reverse it later.
+    # ── Label encoding ─────────────────────────────────────────────────────
     le_district = LabelEncoder()
     le_state    = LabelEncoder()
-
     features_df["district_encoded"] = le_district.fit_transform(
         features_df["district_name"]
     )
@@ -218,435 +343,288 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
         features_df["state_name"]
     )
 
-    # Drop rows where June data is missing (can't predict without it)
-    before_drop = len(features_df)
-    features_df = features_df.dropna(subset=[
-        "june_rainfall_mm", "june_departure_pct"
-    ])
-    dropped = before_drop - len(features_df)
+    # ── Drop rows missing core features ────────────────────────────────────
+    before = len(features_df)
+    features_df = features_df.dropna(
+        subset=["june_rainfall_mm", "june_departure_pct",
+                "june_rolling_7d_avg"]
+    )
+    dropped = before - len(features_df)
     if dropped > 0:
-        print(f"Dropped {dropped} rows with missing June data.\n")
+        print(f"Dropped {dropped} rows missing core June features.")
 
-    print(f"Feature matrix shape: {features_df.shape}")
-    print(f"Features built for {features_df['district_name'].nunique()} districts\n")
+    # ── Median-impute GEE features (NaN when GEE not run) ─────────────────
+    gee_feature_cols = ["susm_may_mean", "susm_may_max",
+                        "temp_june_mean", "temp_june_stress_days"]
+    for col in gee_feature_cols:
+        if col in features_df.columns and features_df[col].isna().any():
+            median_val = features_df[col].median()
+            n_filled   = features_df[col].isna().sum()
+            features_df[col] = features_df[col].fillna(median_val)
+            if n_filled > 0:
+                print(f"  Imputed {n_filled} NaN in '{col}' "
+                      f"with median {median_val:.2f}")
+
+    # Fill remaining NaN lag/streak/spi with 0
+    for col in ["june_rain_lag_1d", "june_rain_lag_7d",
+                "june_dry_streak",  "june_spi_30d", "enso_code"]:
+        if col in features_df.columns:
+            features_df[col] = features_df[col].fillna(0)
+
+    n_gee_available = features_df["susm_may_mean"].notna().sum()
+    print(f"\nFeature matrix: {features_df.shape}")
+    print(f"GEE features available: {n_gee_available}/{len(features_df)} rows")
+    print(f"Districts: {features_df['district_name'].nunique()}\n")
 
     return features_df, le_district, le_state
 
 
 # =============================================================================
-# SECTION 4 — TRAIN / TEST SPLIT
+# SECTION 7 — GRIDSEARCHCV
 # =============================================================================
 
-"""
-BEGINNER CONCEPT — Why Split Data at All?
-──────────────────────────────────────────
-If you train the model on ALL your data and then test it on the same data,
-it's like giving students the exam questions in advance — of course they'll
-score 100%. That tells you nothing about real-world performance.
+def run_gridsearch(X: np.ndarray, y: np.ndarray) -> tuple:
+    """GridSearchCV: 18 parameter combinations × 5-fold CV = 90 fits."""
 
-Splitting means: train on SOME years → test on YEARS THE MODEL NEVER SAW.
+    print("=" * 65)
+    print("  GRIDSEARCHCV — HYPERPARAMETER TUNING")
+    print("=" * 65)
 
-The Challenge with 8 Years of Data:
-  8 years is a very small dataset for ML. Standard 80/20 splits would give
-  us only ~1–2 test years, which is statistically unreliable.
+    param_grid = {
+        "n_estimators": [100, 500, 1000],
+        "max_features": ["sqrt", "log2"],
+        "max_depth"   : [None, 5, 10],
+    }
 
-Our Solution — Leave-One-Out Cross Validation (LOOCV):
-  We train 8 separate models, each time leaving out 1 year as the test set.
-  This uses every year as a test year exactly once, giving us the most
-  honest performance estimate possible with limited data.
-  
-  Round 1: Train on 2017-2023 → Test on 2016
-  Round 2: Train on 2016,2018-2023 → Test on 2017
-  ... and so on for all 8 years.
-"""
+    n_combos = 18
+    print(f"\nParameter grid ({n_combos} combinations × 5-fold = 90 fits):")
+    for p, v in param_grid.items():
+        print(f"  {p}: {v}")
 
-def get_feature_columns() -> list:
-    """
-    Returns the list of column names used as model inputs (features X).
-    Centralised here so training and prediction always use identical features.
-    """
-    return [
-        "june_rainfall_mm",       # Raw June total
-        "june_departure_pct",     # How anomalous was June?
-        "june_vs_district_mean",  # June relative to district's 8yr average
-        "june_was_above_normal",  # Binary: was June itself above normal?
-        "district_mean_mm",       # District's historical average season
-        "district_std_mm",        # District's historical variability
-        "district_cv",            # Coefficient of variation (consistency)
-        "district_encoded",       # District identity (as number)
-        "state_encoded",          # State identity (as number)
+    base_rf = RandomForestClassifier(
+        random_state=42, class_weight="balanced", n_jobs=-1
+    )
+
+    grid_search = GridSearchCV(
+        estimator=base_rf, param_grid=param_grid,
+        cv=5, scoring="accuracy", n_jobs=-1, verbose=1, refit=True
+    )
+
+    print(f"\nRunning... (2–5 minutes)\n")
+    grid_search.fit(X, y)
+
+    results_df = pd.DataFrame(grid_search.cv_results_)[
+        ["param_n_estimators", "param_max_features", "param_max_depth",
+         "mean_test_score", "std_test_score", "rank_test_score"]
+    ].sort_values("rank_test_score")
+
+    print("\n── All combinations ranked ───────────────────────────────────")
+    print(results_df.to_string(index=False))
+    print("\n── Best Parameters ───────────────────────────────────────────")
+    for p, v in grid_search.best_params_.items():
+        print(f"  {p:<20} : {v}")
+    print(f"\n── Best 5-fold CV : {grid_search.best_score_:.2%}")
+
+    return grid_search.best_estimator_, grid_search, results_df
+
+
+# =============================================================================
+# SECTION 8 — LOOCV EVALUATION
+# =============================================================================
+
+def evaluate_with_loocv(model, X, y) -> np.ndarray:
+    """LOOCV honest accuracy estimate for small datasets."""
+
+    print("\n── Leave-One-Out CV ──────────────────────────────────────────")
+    loo_scores = cross_val_score(
+        model, X, y, cv=LeaveOneOut(), scoring="accuracy"
+    )
+    print(f"  Rounds   : {len(loo_scores)}")
+    print(f"  Mean     : {loo_scores.mean():.2%}")
+    print(f"  Std      : {loo_scores.std():.2%}")
+    print(f"  Min/Max  : {loo_scores.min():.2%} / {loo_scores.max():.2%}")
+
+    mean = loo_scores.mean()
+    verdict = (
+        "GOOD"          if mean >= 0.75 else
+        "MODERATE-GOOD" if mean >= 0.65 else
+        "MODERATE"      if mean >= 0.60 else "WEAK"
+    )
+    print(f"  Verdict  : {verdict}\n")
+    return loo_scores
+
+
+# =============================================================================
+# SECTION 9 — FEATURE IMPORTANCE PLOT
+# =============================================================================
+
+def plot_feature_importance(model, feature_cols: list,
+                             output_folder: str) -> None:
+    """Saves feature importance bar chart to models/feature_importance.png."""
+
+    importances = model.feature_importances_
+    indices     = np.argsort(importances)[::-1]
+    sorted_feat = [feature_cols[i] for i in indices]
+    sorted_imp  = importances[indices]
+
+    # Colour-code by feature group for easy reading
+    group_colours = {
+        "june_rainfall_mm"      : "#2d7a4f",
+        "june_departure_pct"    : "#2d7a4f",
+        "june_vs_district_mean" : "#2d7a4f",
+        "june_was_above_normal" : "#2d7a4f",
+        "june_rolling_7d_avg"   : "#1a5fa8",
+        "june_cumulative_rain"  : "#1a5fa8",
+        "june_rain_lag_1d"      : "#1a5fa8",
+        "june_rain_lag_7d"      : "#1a5fa8",
+        "june_dry_streak"       : "#1a5fa8",
+        "june_spi_30d"          : "#7b2d8b",
+        "enso_code"             : "#7b2d8b",
+        "susm_may_mean"         : "#c07a00",
+        "susm_may_max"          : "#c07a00",
+        "temp_june_mean"        : "#c07a00",
+        "temp_june_stress_days" : "#c07a00",
+    }
+    default_colour = "#555555"
+
+    colors = [group_colours.get(f, default_colour) for f in sorted_feat]
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    fig.patch.set_facecolor("#fafafa")
+    ax.set_facecolor("#fafafa")
+
+    bars = ax.barh(range(len(sorted_feat)), sorted_imp,
+                   color=colors, height=0.65,
+                   edgecolor="white", linewidth=0.4)
+
+    ax.set_yticks(range(len(sorted_feat)))
+    ax.set_yticklabels(sorted_feat, fontsize=8.5)
+    ax.set_xlabel("Feature Importance (Mean Gini Reduction)",
+                  fontsize=9, color="#555")
+    ax.set_title("Feature Importances — v4 Climate Context Model",
+                 fontsize=11, fontweight="600", color="#1a1a2e", pad=10)
+    ax.invert_yaxis()
+
+    for bar, val in zip(bars, sorted_imp):
+        ax.text(val + 0.002, bar.get_y() + bar.get_height() / 2,
+                f"{val:.3f}", va="center", fontsize=7.5, color="#333")
+
+    patches = [
+        mpatches.Patch(color="#2d7a4f", label="Core June signal"),
+        mpatches.Patch(color="#1a5fa8", label="Temporal pattern"),
+        mpatches.Patch(color="#7b2d8b", label="Climate context (SPI/ENSO)"),
+        mpatches.Patch(color="#c07a00", label="GEE: soil moisture & temp"),
+        mpatches.Patch(color="#555555", label="District context & encoding"),
     ]
+    ax.legend(handles=patches, fontsize=7.5, loc="lower right", framealpha=0.9)
+    ax.spines[["top","right"]].set_visible(False)
+    ax.spines[["left","bottom"]].set_color("#ddd")
+    ax.xaxis.grid(True, linestyle="--", alpha=0.4, zorder=0)
+    ax.set_xlim(0, max(sorted_imp) * 1.22)
 
-
-def split_and_evaluate(features_df: pd.DataFrame) -> tuple:
-    """
-    Performs Leave-One-Out Cross Validation to evaluate model performance,
-    then trains a FINAL model on ALL available data for production use.
-
-    Returns:
-        final_model  — trained on 100% of data, ready for deployment
-        cv_scores    — array of accuracy scores from each LOOCV round
-    """
-
-    FEATURE_COLS = get_feature_columns()
-    TARGET_COL   = "target_above_normal"
-
-    X = features_df[FEATURE_COLS].values   # Feature matrix (inputs)
-    y = features_df[TARGET_COL].values     # Target vector (answers)
-
-    # ── Random Forest configuration ────────────────────────────────────────
-    # n_estimators=100 : use 100 decision trees (more = more stable, slower)
-    # max_depth=4      : limit tree depth to prevent overfitting on small data
-    # random_state=42  : fixed seed so results are reproducible every run
-    # class_weight='balanced' : compensates if one class (above/not) is rarer
-    model = RandomForestClassifier(
-        n_estimators  = 100,
-        max_depth     = 4,
-        random_state  = 42,
-        class_weight  = "balanced"
-    )
-
-    # ── Leave-One-Out Cross Validation ─────────────────────────────────────
-    print("Running Leave-One-Out Cross Validation...")
-    print("(Each year is held out once as the test set)\n")
-
-    loo = LeaveOneOut()
-
-    cv_scores = cross_val_score(
-        model, X, y,
-        cv      = loo,
-        scoring = "accuracy"
-    )
-
-    print(f"LOOCV Results across {len(cv_scores)} rounds:")
-    print(f"  Accuracy per round : {[round(s,2) for s in cv_scores]}")
-    print(f"  Mean accuracy      : {cv_scores.mean():.2%}")
-    print(f"  Std deviation      : {cv_scores.std():.2%}")
-
-    # ── Interpretation guide ───────────────────────────────────────────────
-    mean_acc = cv_scores.mean()
-    if mean_acc >= 0.75:
-        verdict = "GOOD — model has useful predictive signal"
-    elif mean_acc >= 0.60:
-        verdict = "MODERATE — better than random, but interpret with caution"
-    else:
-        verdict = "WEAK — model struggles; more data or features needed"
-    print(f"  Verdict            : {verdict}\n")
-
-    # ── Confusion Matrix via LOOCV predictions ─────────────────────────────
-    # cross_val_predict collects each fold's held-out prediction,
-    # giving us a full y_pred aligned with y for the confusion matrix.
-    print("Generating confusion matrix from LOOCV predictions...")
-    y_pred_loo = cross_val_predict(model, X, y, cv=loo)
-
-    cm = confusion_matrix(y, y_pred_loo)
-    print("\nConfusion Matrix (LOOCV):")
-    print(f"  Labels: 0 = Not Above-Normal | 1 = Above-Normal")
-    print(cm)
-    print()
-    print(classification_report(
-        y, y_pred_loo,
-        target_names=["Not Above-Normal", "Above-Normal"]
-    ))
-
-    # ── Plot and save confusion matrix ────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(6, 5))
-    sns.heatmap(
-        cm,
-        annot=True, fmt="d", cmap="Blues",
-        xticklabels=["Not Above-Normal", "Above-Normal"],
-        yticklabels=["Not Above-Normal", "Above-Normal"],
-        ax=ax
-    )
-    ax.set_xlabel("Predicted Label", fontsize=12)
-    ax.set_ylabel("True Label", fontsize=12)
-    ax.set_title("Confusion Matrix — Rainfall Prediction (LOOCV)", fontsize=13)
     plt.tight_layout()
-
-    os.makedirs("models", exist_ok=True)
-    cm_path = "models/confusion_matrix.png"
-    plt.savefig(cm_path, dpi=150)
+    os.makedirs(output_folder, exist_ok=True)
+    save_path = os.path.join(output_folder, "feature_importance.png")
+    plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="#fafafa")
     plt.close()
-    print(f"Confusion matrix plot saved → {cm_path}\n")
+    print(f"Feature importance chart → {save_path}")
 
-    # ── Train FINAL model on ALL data ──────────────────────────────────────
-    # LOOCV was only for evaluation. The actual deployed model trains on
-    # everything — more data = better generalisation for new predictions.
-    print("Training final model on full dataset...")
-    model.fit(X, y)
-    print("Final model trained.\n")
-
-    # ── Feature importance — what does the model rely on most? ─────────────
-    print("Feature importances (higher = more influential):")
-    importance_df = pd.DataFrame({
-        "feature":   FEATURE_COLS,
-        "importance": model.feature_importances_
-    }).sort_values("importance", ascending=False)
-
-    for _, row in importance_df.iterrows():
-        bar = "█" * int(row["importance"] * 40)
-        print(f"  {row['feature']:<30} {bar}  {row['importance']:.3f}")
+    print("\n── Feature Importances (ranked) ──────────────────────────────")
+    for feat, imp in zip(sorted_feat, sorted_imp):
+        bar_str = "█" * int(imp * 50)
+        print(f"  {feat:<30} {bar_str:<18}  {imp:.4f}")
     print()
 
-    return model, cv_scores, importance_df, y_pred_loo
-
 
 # =============================================================================
-# SECTION 5 — SAVE THE MODEL AND METADATA
+# SECTION 10 — SAVE ARTIFACTS
 # =============================================================================
 
-"""
-BEGINNER CONCEPT — What is a .pkl file?
-────────────────────────────────────────
-pkl = "pickle" — Python's way of freezing any object to disk.
-Training a model = teaching it patterns from data (takes compute + time).
-Pickling = saving that trained state so you NEVER have to retrain.
-
-In the dashboard (Step 4), we'll just load the .pkl and predict instantly
-without touching the training data again.
-"""
-
-def save_model_artifacts(model,
-                          le_district: LabelEncoder,
-                          le_state:    LabelEncoder,
-                          importance_df: pd.DataFrame,
-                          cv_scores:   np.ndarray,
-                          output_folder: str) -> None:
-    """
-    Saves three files to the models/ folder:
-      1. rainfall_model.pkl    — the trained Random Forest
-      2. model_metadata.pkl    — encoders + feature list (needed at prediction time)
-      3. model_report.csv      — feature importances for reference
-    """
+def save_model_artifacts(model, le_district, le_state,
+                          loo_scores, best_params,
+                          grid_results, output_folder) -> None:
+    """Saves model + metadata + GridSearch log to models/ folder."""
 
     os.makedirs(output_folder, exist_ok=True)
 
-    # ── 1. Save the trained model ──────────────────────────────────────────
     model_path = os.path.join(output_folder, "rainfall_model.pkl")
-    with open(model_path, "wb") as f:      # "wb" = write bytes
+    with open(model_path, "wb") as f:
         pickle.dump(model, f)
-    print(f"Model saved       → {model_path}")
+    print(f"Model saved    → {model_path}")
 
-    # ── 2. Save metadata (everything the dashboard needs alongside model) ──
-    # The dashboard needs the SAME encoders used during training to convert
-    # district/state names to the numbers the model expects.
     metadata = {
-        "feature_columns"     : get_feature_columns(),
-        "label_encoder_district": le_district,
-        "label_encoder_state"   : le_state,
-        "above_normal_threshold": ABOVE_NORMAL_THRESHOLD,
-        "predictor_month"       : PREDICTOR_MONTH,
-        "target_season"         : TARGET_SEASON,
-        "cv_mean_accuracy"      : cv_scores.mean(),
-        "cv_std_accuracy"       : cv_scores.std(),
-        "known_districts"       : list(le_district.classes_),
-        "known_states"          : list(le_state.classes_),
+        "feature_columns"        : get_feature_columns(),
+        "label_encoder_district" : le_district,
+        "label_encoder_state"    : le_state,
+        "above_normal_threshold" : ABOVE_NORMAL_THRESHOLD,
+        "predictor_month"        : PREDICTOR_MONTH,
+        "target_season"          : TARGET_SEASON,
+        "cv_mean_accuracy"       : float(loo_scores.mean()),
+        "cv_std_accuracy"        : float(loo_scores.std()),
+        "gridsearch_best_params" : best_params,
+        "gridsearch_5fold_score" : float(loo_scores.mean()),
+        "known_districts"        : list(le_district.classes_),
+        "known_states"           : list(le_state.classes_),
     }
 
     metadata_path = os.path.join(output_folder, "model_metadata.pkl")
     with open(metadata_path, "wb") as f:
         pickle.dump(metadata, f)
-    print(f"Metadata saved    → {metadata_path}")
+    print(f"Metadata saved → {metadata_path}")
 
-    # ── 3. Save feature importance report as CSV ───────────────────────────
-    report_path = os.path.join(output_folder, "model_report.csv")
-    importance_df.to_csv(report_path, index=False)
-    print(f"Report saved      → {report_path}\n")
-
-
-# =============================================================================
-# SECTION 6 — PREDICTION HELPER (used by the dashboard in Step 4)
-# =============================================================================
-
-def predict_for_district(district_name:    str,
-                          state_name:       str,
-                          june_rainfall_mm: float,
-                          model_folder:     str = "models/") -> dict:
-    """
-    Loads the saved model and makes a prediction for a single district.
-
-    This is the function the Streamlit dashboard will call in Step 4.
-    It takes human-readable inputs and returns a probability + category.
-
-    Args:
-        district_name    : e.g. "Warangal"
-        state_name       : e.g. "Telangana"
-        june_rainfall_mm : total rainfall recorded in June for this district
-
-    Returns:
-        dict with keys: probability, category, confidence, advice
-    """
-
-    # ── Load saved model and metadata ─────────────────────────────────────
-    model_path    = os.path.join(model_folder, "rainfall_model.pkl")
-    metadata_path = os.path.join(model_folder, "model_metadata.pkl")
-
-    with open(model_path,    "rb") as f: model    = pickle.load(f)
-    with open(metadata_path, "rb") as f: metadata = pickle.load(f)
-
-    le_district = metadata["label_encoder_district"]
-    le_state    = metadata["label_encoder_state"]
-
-    # ── Handle unseen districts gracefully ────────────────────────────────
-    # If the dashboard user selects a district not in training data, we
-    # can't encode it. Return a clear error rather than crashing.
-    if district_name not in metadata["known_districts"]:
-        return {
-            "error": f"District '{district_name}' was not in training data. "
-                     f"Available: {metadata['known_districts'][:5]}..."
-        }
-
-    district_enc = le_district.transform([district_name])[0]
-    state_enc    = le_state.transform([state_name])[0] \
-                   if state_name in metadata["known_states"] else 0
-
-    # ── Build the feature vector for this prediction ───────────────────────
-    # We need district historical stats — load them from the seasonal CSV
-    seasonal_df = pd.read_csv("data/processed/03_seasonal_with_departure.csv")
-    kharif_df   = seasonal_df[seasonal_df["season"] == TARGET_SEASON]
-    dist_stats  = kharif_df[kharif_df["district_name"] == district_name][
-        "total_rainfall_mm"
-    ]
-
-    district_mean = dist_stats.mean() if len(dist_stats) > 0 else 500
-    district_std  = dist_stats.std()  if len(dist_stats) > 0 else 100
-    district_cv   = district_std / district_mean if district_mean > 0 else 0.2
-
-    june_lpa_path = "data/processed/02_monthly_with_departure.csv"
-    monthly_df    = pd.read_csv(june_lpa_path)
-    june_lpa_row  = monthly_df[
-        (monthly_df["district_name"] == district_name) &
-        (monthly_df["month"] == PREDICTOR_MONTH)
-    ]["lpa_mm"]
-    june_lpa = june_lpa_row.mean() if len(june_lpa_row) > 0 else district_mean / 4
-
-    june_departure_pct   = ((june_rainfall_mm - june_lpa) / june_lpa * 100) \
-                           if june_lpa > 0 else 0
-    june_vs_district_mean = june_rainfall_mm / district_mean \
-                            if district_mean > 0 else 1.0
-    june_was_above_normal = int(june_departure_pct > ABOVE_NORMAL_THRESHOLD)
-
-    # Assemble into the same order as training features
-    feature_vector = [[
-        june_rainfall_mm,
-        june_departure_pct,
-        june_vs_district_mean,
-        june_was_above_normal,
-        district_mean,
-        district_std,
-        district_cv,
-        district_enc,
-        state_enc,
-    ]]
-
-    # ── Make prediction ────────────────────────────────────────────────────
-    # predict_proba returns [[prob_class_0, prob_class_1]]
-    # class 1 = Above-Normal, so we take index [0][1]
-    probability = model.predict_proba(feature_vector)[0][1]
-
-    # ── Map probability to IMD category and farmer advice ─────────────────
-    if probability >= 0.70:
-        category = "Above Normal"
-        colour   = "green"
-        advice   = (
-            "High confidence of above-normal monsoon. "
-            "Proceed with full Kharif sowing plan. "
-            "Ensure drainage channels are clear to handle surplus water."
-        )
-    elif probability >= 0.50:
-        category = "Normal to Above Normal"
-        colour   = "blue"
-        advice   = (
-            "Moderate confidence of good monsoon. "
-            "Sow primary crops as planned but keep 20% area as buffer. "
-            "Monitor weekly rainfall and adjust irrigation accordingly."
-        )
-    elif probability >= 0.35:
-        category = "Normal"
-        colour   = "orange"
-        advice   = (
-            "Season likely to be near average. "
-            "Follow standard sowing schedule. "
-            "Keep drought-tolerant variety seeds as backup."
-        )
-    else:
-        category = "Below Normal"
-        colour   = "red"
-        advice   = (
-            "Risk of below-normal monsoon. "
-            "Consider drought-resistant crop varieties. "
-            "Prioritise water conservation. "
-            "Consult local Krishi Vigyan Kendra before full sowing."
-        )
-
-    return {
-        "district"          : district_name,
-        "state"             : state_name,
-        "june_rainfall_mm"  : june_rainfall_mm,
-        "june_departure_pct": round(june_departure_pct, 2),
-        "probability"       : round(probability * 100, 1),
-        "category"          : category,
-        "colour"            : colour,
-        "advice"            : advice,
-        "model_accuracy"    : round(metadata["cv_mean_accuracy"] * 100, 1),
-    }
+    gs_path = os.path.join(output_folder, "gridsearch_results.csv")
+    grid_results.to_csv(gs_path, index=False)
+    print(f"GridSearch log → {gs_path}\n")
 
 
 # =============================================================================
-# SECTION 7 — MAIN ORCHESTRATOR
+# SECTION 11 — MAIN ORCHESTRATOR
 # =============================================================================
 
 def run_trainer():
-    """
-    Master function — runs the full training pipeline end to end.
-    """
 
     print("=" * 65)
-    print("  RAINFALL PREDICTION ENGINE — TRAINING START")
+    print("  RAINFALL PREDICTION ENGINE v4 — TRAINING START")
     print("=" * 65 + "\n")
 
-    # Step 1: Load cleaned seasonal data from pipeline output
-    seasonal_df = load_seasonal_data(SEASONAL_DATA_PATH)
+    # 1. Load data
+    seasonal_df, monthly_df, daily_df = load_data()
 
-    # Step 2: Engineer features and build the ML-ready matrix
-    features_df, le_district, le_state = build_feature_matrix(seasonal_df)
+    # 2. Build feature matrix
+    features_df, le_district, le_state = build_feature_matrix(
+        seasonal_df, monthly_df, daily_df
+    )
 
-    # Step 3: Evaluate with LOOCV, train final model on full data
-    model, cv_scores, importance_df, y_pred_loo = split_and_evaluate(features_df)
+    FEATURE_COLS = get_feature_columns()
+    X = features_df[FEATURE_COLS].values
+    y = features_df["target_above_normal"].values
 
-    # Step 4: Save model, encoders, and report to disk
-    print("Saving model artifacts...")
+    print(f"Training: {X.shape[0]} samples × {X.shape[1]} features\n")
+
+    # 3. GridSearchCV
+    best_model, grid_search, grid_results = run_gridsearch(X, y)
+
+    # 4. LOOCV
+    loo_scores = evaluate_with_loocv(best_model, X, y)
+
+    # 5. Feature importance
+    plot_feature_importance(best_model, FEATURE_COLS, MODEL_OUTPUT_FOLDER)
+
+    # 6. Save
+    print("Saving artifacts...")
     save_model_artifacts(
-        model, le_district, le_state,
-        importance_df, cv_scores,
-        MODEL_OUTPUT_FOLDER
+        model=best_model, le_district=le_district, le_state=le_state,
+        loo_scores=loo_scores, best_params=grid_search.best_params_,
+        grid_results=grid_results, output_folder=MODEL_OUTPUT_FOLDER
     )
-
-    # Step 5: Quick smoke test — predict for a sample district
-    print("─" * 65)
-    print("SMOKE TEST — sample prediction")
-    print("─" * 65)
-
-    sample_district = features_df["district_name"].iloc[0]
-    sample_state    = features_df["state_name"].iloc[0]
-    sample_june_mm  = features_df["june_rainfall_mm"].iloc[0]
-
-    result = predict_for_district(
-        district_name    = sample_district,
-        state_name       = sample_state,
-        june_rainfall_mm = sample_june_mm
-    )
-
-    print(f"District          : {result['district']}, {result['state']}")
-    print(f"June rainfall     : {result['june_rainfall_mm']} mm "
-          f"(departure: {result['june_departure_pct']}%)")
-    print(f"Prediction        : {result['category']}")
-    print(f"Probability       : {result['probability']}% chance of Above-Normal")
-    print(f"Farmer advice     : {result['advice']}")
-    print(f"Model accuracy    : {result['model_accuracy']}% (LOOCV)")
 
     print("\n" + "=" * 65)
-    print("  TRAINING COMPLETE — check models/ folder for outputs")
+    print("  TRAINING COMPLETE")
+    print(f"  Features    : {len(FEATURE_COLS)} total")
+    print(f"  Best params : {grid_search.best_params_}")
+    print(f"  5-fold CV   : {grid_search.best_score_:.2%}")
+    print(f"  LOOCV       : {loo_scores.mean():.2%}")
+    print("  Check models/feature_importance.png")
     print("=" * 65)
 
 

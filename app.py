@@ -279,9 +279,13 @@ def make_ml_prediction(model, metadata, district: str, state: str,
                         june_mm: float, seasonal_df: pd.DataFrame,
                         monthly_df: pd.DataFrame) -> float:
     """
-    Runs the trained ML model for the selected district and June rainfall.
-    Returns the probability (0–100) of Above-Normal season.
+    Runs the trained model for the selected district and June rainfall.
+    v4: Builds a 20-feature vector matching get_feature_columns() in
+    train_model.py. Temporal + SPI + ENSO + GEE features are estimated
+    from the june_mm input and historical data in the loaded DataFrames.
+    Returns the probability (0–100) of Above-Normal season, or None.
     """
+
     le_district = metadata["label_encoder_district"]
     le_state    = metadata["label_encoder_state"]
 
@@ -292,7 +296,7 @@ def make_ml_prediction(model, metadata, district: str, state: str,
     state_enc    = le_state.transform([state])[0] \
                    if state in metadata["known_states"] else 0
 
-    # District historical stats from seasonal data
+    # ── District historical context ────────────────────────────────────────
     kharif_rows  = seasonal_df[
         (seasonal_df["district_name"] == district) &
         (seasonal_df["season"] == "Kharif")
@@ -302,25 +306,93 @@ def make_ml_prediction(model, metadata, district: str, state: str,
     district_std  = kharif_rows.std()  if len(kharif_rows) > 0 else 100
     district_cv   = district_std / district_mean if district_mean > 0 else 0.2
 
-    # June LPA for this district
+    # ── June LPA and departure ─────────────────────────────────────────────
     june_rows = monthly_df[
         (monthly_df["district_name"] == district) &
         (monthly_df["month"] == 6)
     ]["lpa_mm"]
     june_lpa = june_rows.mean() if len(june_rows) > 0 else district_mean / 4
 
-    june_departure_pct    = ((june_mm - june_lpa) / june_lpa * 100) if june_lpa > 0 else 0
+    june_departure_pct    = ((june_mm - june_lpa) / june_lpa * 100) \
+                             if june_lpa > 0 else 0
     june_vs_district_mean = june_mm / district_mean if district_mean > 0 else 1.0
     june_was_above_normal = int(june_departure_pct > 5)
 
+    # ── Temporal feature estimates (from june_mm total) ───────────────────
+    daily_avg            = june_mm / 30.0
+    june_rolling_7d_avg  = daily_avg * 7
+    june_cumulative_rain = june_mm
+    june_rain_lag_1d     = daily_avg
+    june_rain_lag_7d     = daily_avg
+    rainy_fraction       = min(june_mm / (june_lpa * 1.2), 1.0) \
+                           if june_lpa > 0 else 0.5
+    june_dry_streak      = round((1 - rainy_fraction) * 20)
+
+    # ── SPI estimate ───────────────────────────────────────────────────────
+    # Z-score of june_mm relative to the district's historical June mean/std.
+    # Uses the monthly DataFrame's departure_pct as a proxy if spi not stored.
+    june_spi_30d = june_departure_pct / 33.3   # rough conversion: ±100% ≈ ±3σ
+
+    # ── ENSO code for current year ─────────────────────────────────────────
+    # Look up from seasonal data if available, else default to Neutral (1)
+    import datetime
+    current_year = datetime.datetime.now().year
+    enso_lookup  = {
+        2017: 1, 2018: 1, 2019: 2, 2020: 0,
+        2021: 0, 2022: 0, 2023: 2, 2024: 1, 2025: 0,
+    }
+    enso_code = enso_lookup.get(current_year, 1)
+
+    # ── GEE features — use historical district median if available ─────────
+    # Pull from seasonal_df if enrich_with_gee_features() has been run.
+    def _dist_median(col: str) -> float:
+        if col in seasonal_df.columns:
+            vals = seasonal_df[
+                seasonal_df["district_name"] == district
+            ][col].dropna()
+            return float(vals.median()) if len(vals) > 0 else float("nan")
+        return float("nan")
+
+    susm_may_mean         = _dist_median("susm_may_mean")
+    susm_may_max          = _dist_median("susm_may_max")
+    temp_june_mean        = _dist_median("temp_june_mean")
+    temp_june_stress_days = _dist_median("temp_june_stress_days")
+
+    # If GEE data not yet available, use sensible defaults for Telangana
+    import math
+    if math.isnan(susm_may_mean):         susm_may_mean         = 45.0
+    if math.isnan(susm_may_max):          susm_may_max          = 65.0
+    if math.isnan(temp_june_mean):        temp_june_mean        = 32.0
+    if math.isnan(temp_june_stress_days): temp_june_stress_days = 8.0
+
+    # ── Feature vector — must match get_feature_columns() in train_model.py ─
+    # Order: Group A (4) | Group B (5) | Group C (2) | Group D (4) |
+    #        Group E (3) | Group F (2)  = 20 total
     feature_vector = [[
+        # Group A — Core June signal
         june_mm,
         june_departure_pct,
         june_vs_district_mean,
         june_was_above_normal,
+        # Group B — Temporal pattern
+        june_rolling_7d_avg,
+        june_cumulative_rain,
+        june_rain_lag_1d,
+        june_rain_lag_7d,
+        june_dry_streak,
+        # Group C — Climate context
+        june_spi_30d,
+        enso_code,
+        # Group D — GEE soil moisture & temperature
+        susm_may_mean,
+        susm_may_max,
+        temp_june_mean,
+        temp_june_stress_days,
+        # Group E — District historical context
         district_mean,
         district_std,
         district_cv,
+        # Group F — Identity encoding
         district_enc,
         state_enc,
     ]]
